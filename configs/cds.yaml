@@ -1,0 +1,13 @@
+# CDS config: a top-level YAML list of Envoy Cluster resources -
+# https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto
+# Endpoint membership is resolved dynamically via EDS (see eds.yaml), not
+# embedded here. Edit and save while xds-server is running - this file is
+# polled and hot-reloaded independently of the other config files.
+
+- name: backend_cluster
+  connect_timeout: 5s
+  type: EDS
+  eds_cluster_config:
+    eds_config:
+      ads: {}
+  lb_policy: ROUND_ROBIN

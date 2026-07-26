@@ -1,0 +1,29 @@
+# LDS config: a top-level YAML list of Envoy Listener resources -
+# https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/listener/v3/listener.proto
+# Routes are resolved dynamically via RDS (see rds.yaml), not embedded here.
+# Edit and save while xds-server is running - this file is polled and
+# hot-reloaded independently of the other config files.
+#
+# Referencing a new extension type (another filter, transport socket, etc.)
+# needs a matching blank import added in internal/config/register.go so
+# protojson can resolve its "@type".
+
+- name: backend_cluster_listener
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 10000
+  filter_chains:
+    - filters:
+        - name: envoy.filters.network.http_connection_manager
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+            stat_prefix: ingress_http
+            rds:
+              route_config_name: backend_cluster_route
+              config_source:
+                ads: {}
+            http_filters:
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

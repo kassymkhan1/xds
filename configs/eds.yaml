@@ -1,0 +1,16 @@
+# EDS config: a top-level YAML list of Envoy ClusterLoadAssignment resources -
+# https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/endpoint/v3/endpoint.proto
+# cluster_name must match an EDS-type cluster's name in cds.yaml. Optional:
+# xds-server runs fine with no eds.yaml if every cluster is self-contained
+# (e.g. type: STRICT_DNS with an inline load_assignment). Edit and save while
+# xds-server is running - this file is polled and hot-reloaded independently
+# of the other config files.
+
+- cluster_name: backend_cluster
+  endpoints:
+    - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8080

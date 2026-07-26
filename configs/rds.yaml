@@ -1,0 +1,17 @@
+# RDS config: a top-level YAML list of Envoy RouteConfiguration resources -
+# https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/route/v3/route.proto
+# name must match the route_config_name referenced from a listener's rds
+# block in lds.yaml. Optional: xds-server runs fine with no rds.yaml if every
+# listener embeds its own route_config inline instead. Edit and save while
+# xds-server is running - this file is polled and hot-reloaded independently
+# of the other config files.
+
+- name: backend_cluster_route
+  virtual_hosts:
+    - name: local_service
+      domains: ["*"]
+      routes:
+        - match:
+            prefix: "/"
+          route:
+            cluster: backend_cluster

@@ -1,0 +1,23 @@
+# SDS config: a top-level YAML list of Envoy Secret resources -
+# https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/transport_sockets/tls/v3/secret.proto
+# name must match the sds config_source name referenced from a listener's
+# transport_socket (downstream) or a cluster's transport_socket (upstream) -
+# see lds.yaml / cds.yaml. Optional: xds-server runs fine with no sds.yaml if
+# nothing references a secret dynamically. Edit and save while xds-server is
+# running - this file is polled and hot-reloaded independently of the other
+# config files.
+#
+# Paths below (certificate_chain/private_key filename) are read by Envoy
+# itself, not by xds-server - they must exist on the Envoy node's filesystem.
+
+- name: server_cert
+  tls_certificate:
+    certificate_chain:
+      filename: /etc/envoy/certs/server.crt
+    private_key:
+      filename: /etc/envoy/certs/server.key
+
+- name: client_validation_context
+  validation_context:
+    trusted_ca:
+      filename: /etc/envoy/certs/ca.crt
