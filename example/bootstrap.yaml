@@ -2,13 +2,13 @@
 # LDS, RDS) from the xds-server control plane in this repo via ADS.
 #
 # Run the control plane:
-#   go run ./cmd/xds-server -port 18000 -node-id test-id
+#   go run ./cmd/xds-server -grpc-addr :18000 -node-id test-id
 #
 # Then run Envoy against this bootstrap:
 #   envoy -c example/bootstrap.yaml
 #
 # Envoy's admin interface will be on :9901, and the dynamically configured
-# listener from resources.go will come up on :10000.
+# listener from configs/lds.yaml will come up on :10000.
 
 node:
   id: test-id

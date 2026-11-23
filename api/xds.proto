@@ -1,0 +1,39 @@
+// Management API of the xDS control plane: push and inspect raw Envoy
+// resources at runtime. Ported from inf-xds; the package/service names are
+// unchanged so existing clients keep working on the wire.
+//
+// Regenerate with: make proto
+syntax = "proto3";
+
+package xds;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/kassymkhan1/xds/pkg/api/pb;pb";
+
+service XDS {
+  // GetCDS returns the clusters currently served to Envoy.
+  rpc GetCDS(google.protobuf.Empty) returns (GetCDSResponse) {}
+  // GetLDS returns the listeners currently served to Envoy.
+  rpc GetLDS(google.protobuf.Empty) returns (GetLDSResponse) {}
+  // Cluster replaces the full set of served clusters.
+  rpc Cluster(ClusterRequest) returns (google.protobuf.Empty) {}
+}
+
+// Resource is one binary-encoded Envoy proto (envoy.config.cluster.v3.Cluster
+// or envoy.config.listener.v3.Listener).
+message resource {
+  bytes raw = 1;
+}
+
+message GetCDSResponse {
+  repeated resource clusters = 1;
+}
+
+message ClusterRequest {
+  repeated resource clusters = 1;
+}
+
+message GetLDSResponse {
+  repeated resource listeners = 1;
+}

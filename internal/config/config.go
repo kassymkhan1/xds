@@ -1,18 +1,21 @@
 // Package config loads the raw Envoy xDS resources served by the control
-// plane. Each xDS API has its own config file: CDS (Cluster), EDS
+// plane. Each xDS API has its own source: CDS (Cluster), EDS
 // (ClusterLoadAssignment), LDS (Listener), RDS (RouteConfiguration), and SDS
-// (Secret) - every file a top-level YAML list of that API's resource in its
-// native Envoy proto shape. Each is loaded, validated, and hot-reloaded
-// independently, so a mistake in one doesn't touch the others' last-good
-// config. CDS and LDS are required since there's nothing to serve without
-// at least one cluster and one listener; EDS, RDS, and SDS are optional -
-// their config files may be absent if nothing references them dynamically.
+// (Secret). A source is a local file or an http(s) URL holding a YAML (or
+// JSON) list of that API's resources in their native Envoy proto shape; a
+// single resource not wrapped in a list is accepted too. `{{ env "NAME" }}`
+// placeholders are expanded before parsing (see ExpandEnv).
+//
+// Every resource is checked against Envoy's proto validation rules and for
+// unique names, so a bad config is rejected here instead of being NACKed by
+// every connected Envoy.
 package config
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
@@ -20,11 +23,17 @@ import (
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 )
 
-// Paths locates each xDS API's config file. CDS and LDS must exist; EDS,
-// RDS, and SDS are read if present and skipped (zero resources) if not.
+// Paths locates each xDS API's source (file path or http(s) URL). An empty
+// path means that API isn't loaded from config at all - e.g. clusters and
+// listeners that are only pushed through the management API.
+//
+// A configured CDS or LDS source must exist and define at least one
+// resource. EDS, RDS, and SDS files are optional: a missing file yields zero
+// resources.
 type Paths struct {
 	CDS string
 	EDS string
@@ -33,7 +42,18 @@ type Paths struct {
 	SDS string
 }
 
-// Config is the loaded, validated resource set for one xDS snapshot.
+// All returns every configured (non-empty) source.
+func (p Paths) All() []string {
+	var all []string
+	for _, s := range []string{p.CDS, p.EDS, p.LDS, p.RDS, p.SDS} {
+		if s != "" {
+			all = append(all, s)
+		}
+	}
+	return all
+}
+
+// Config is a loaded, validated resource set for one xDS snapshot.
 type Config struct {
 	Clusters  []*cluster.Cluster
 	Endpoints []*endpoint.ClusterLoadAssignment
@@ -42,152 +62,132 @@ type Config struct {
 	Secrets   []*tls.Secret
 }
 
-// Load reads and validates every file in paths and combines them into one
-// Config.
-func Load(paths Paths) (*Config, error) {
-	clusters, err := loadClusters(paths.CDS)
-	if err != nil {
+// Load reads and validates every configured source in paths. Resource types
+// whose path is empty are left nil.
+func Load(ctx context.Context, paths Paths) (*Config, error) {
+	var (
+		cfg  Config
+		errs []error
+	)
+
+	loadInto(ctx, &errs, &cfg.Clusters, "cds", paths.CDS, true, ParseClusters)
+	loadInto(ctx, &errs, &cfg.Endpoints, "eds", paths.EDS, false, ParseEndpoints)
+	loadInto(ctx, &errs, &cfg.Listeners, "lds", paths.LDS, true, ParseListeners)
+	loadInto(ctx, &errs, &cfg.Routes, "rds", paths.RDS, false, ParseRoutes)
+	loadInto(ctx, &errs, &cfg.Secrets, "sds", paths.SDS, false, ParseSecrets)
+
+	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-
-	listeners, err := loadListeners(paths.LDS)
-	if err != nil {
-		return nil, err
-	}
-
-	endpoints, err := loadEndpoints(paths.EDS)
-	if err != nil {
-		return nil, err
-	}
-
-	routes, err := loadRoutes(paths.RDS)
-	if err != nil {
-		return nil, err
-	}
-
-	secrets, err := loadSecrets(paths.SDS)
-	if err != nil {
-		return nil, err
-	}
-
-	cfg := &Config{
-		Clusters:  clusters,
-		Endpoints: endpoints,
-		Listeners: listeners,
-		Routes:    routes,
-		Secrets:   secrets,
-	}
-	if err := cfg.validate(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
-	}
-	return cfg, nil
+	return &cfg, nil
 }
 
-func loadClusters(path string) ([]*cluster.Cluster, error) {
-	docs, err := readResourceList(path, true)
+// loadInto loads src into *dst unless src is empty (not configured),
+// appending any error to *errs so every broken source is reported at once.
+func loadInto[T any](ctx context.Context, errs *[]error, dst *[]T, api, src string, required bool, parse func([]byte) ([]T, error)) {
+	if src == "" {
+		return
+	}
+	items, err := load(ctx, api, src, required, parse)
 	if err != nil {
-		return nil, fmt.Errorf("reading cds config %q: %w", path, err)
+		*errs = append(*errs, err)
+		return
 	}
-
-	clusters := make([]*cluster.Cluster, len(docs))
-	for i, doc := range docs {
-		c := &cluster.Cluster{}
-		if err := protojson.Unmarshal(doc, c); err != nil {
-			return nil, fmt.Errorf("parsing cds config %q: resource %d: %w", path, i, err)
-		}
-		clusters[i] = c
-	}
-	return clusters, nil
+	*dst = items
 }
 
-func loadListeners(path string) ([]*listener.Listener, error) {
-	docs, err := readResourceList(path, true)
+func load[T any](ctx context.Context, api, src string, required bool, parse func([]byte) ([]T, error)) ([]T, error) {
+	data, err := readSource(ctx, src)
 	if err != nil {
-		return nil, fmt.Errorf("reading lds config %q: %w", path, err)
-	}
-
-	listeners := make([]*listener.Listener, len(docs))
-	for i, doc := range docs {
-		l := &listener.Listener{}
-		if err := protojson.Unmarshal(doc, l); err != nil {
-			return nil, fmt.Errorf("parsing lds config %q: resource %d: %w", path, i, err)
-		}
-		listeners[i] = l
-	}
-	return listeners, nil
-}
-
-func loadEndpoints(path string) ([]*endpoint.ClusterLoadAssignment, error) {
-	docs, err := readResourceList(path, false)
-	if err != nil {
-		return nil, fmt.Errorf("reading eds config %q: %w", path, err)
-	}
-
-	endpoints := make([]*endpoint.ClusterLoadAssignment, len(docs))
-	for i, doc := range docs {
-		e := &endpoint.ClusterLoadAssignment{}
-		if err := protojson.Unmarshal(doc, e); err != nil {
-			return nil, fmt.Errorf("parsing eds config %q: resource %d: %w", path, i, err)
-		}
-		endpoints[i] = e
-	}
-	return endpoints, nil
-}
-
-func loadRoutes(path string) ([]*route.RouteConfiguration, error) {
-	docs, err := readResourceList(path, false)
-	if err != nil {
-		return nil, fmt.Errorf("reading rds config %q: %w", path, err)
-	}
-
-	routes := make([]*route.RouteConfiguration, len(docs))
-	for i, doc := range docs {
-		r := &route.RouteConfiguration{}
-		if err := protojson.Unmarshal(doc, r); err != nil {
-			return nil, fmt.Errorf("parsing rds config %q: resource %d: %w", path, i, err)
-		}
-		routes[i] = r
-	}
-	return routes, nil
-}
-
-func loadSecrets(path string) ([]*tls.Secret, error) {
-	docs, err := readResourceList(path, false)
-	if err != nil {
-		return nil, fmt.Errorf("reading sds config %q: %w", path, err)
-	}
-
-	secrets := make([]*tls.Secret, len(docs))
-	for i, doc := range docs {
-		s := &tls.Secret{}
-		if err := protojson.Unmarshal(doc, s); err != nil {
-			return nil, fmt.Errorf("parsing sds config %q: resource %d: %w", path, i, err)
-		}
-		secrets[i] = s
-	}
-	return secrets, nil
-}
-
-// readResourceList reads path as a top-level YAML list and returns each
-// element as its own JSON document, ready for protojson.Unmarshal. yaml.v3
-// decodes mappings as map[string]interface{}, so re-marshaling through
-// encoding/json (rather than a YAML-specific JSON converter) is enough to
-// produce valid protojson input, including "@type" keys for typed_config.
-//
-// If required is false, a missing file yields an empty (not error) result -
-// that xDS API simply has nothing to serve.
-func readResourceList(path string, required bool) ([]json.RawMessage, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !required && os.IsNotExist(err) {
+		if !required && isNotExist(err) {
 			return nil, nil
 		}
+		return nil, fmt.Errorf("reading %s config %q: %w", api, src, err)
+	}
+
+	items, err := parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s config %q: %w", api, src, err)
+	}
+	if required && len(items) == 0 {
+		return nil, fmt.Errorf("%s config %q: no resources defined", api, src)
+	}
+	return items, nil
+}
+
+// ParseClusters parses a YAML/JSON list of Envoy Clusters.
+func ParseClusters(data []byte) ([]*cluster.Cluster, error) {
+	return parse(data, func() *cluster.Cluster { return &cluster.Cluster{} }, ValidateClusters)
+}
+
+// ParseEndpoints parses a YAML/JSON list of Envoy ClusterLoadAssignments.
+func ParseEndpoints(data []byte) ([]*endpoint.ClusterLoadAssignment, error) {
+	return parse(data, func() *endpoint.ClusterLoadAssignment { return &endpoint.ClusterLoadAssignment{} }, ValidateEndpoints)
+}
+
+// ParseListeners parses a YAML/JSON list of Envoy Listeners.
+func ParseListeners(data []byte) ([]*listener.Listener, error) {
+	return parse(data, func() *listener.Listener { return &listener.Listener{} }, ValidateListeners)
+}
+
+// ParseRoutes parses a YAML/JSON list of Envoy RouteConfigurations.
+func ParseRoutes(data []byte) ([]*route.RouteConfiguration, error) {
+	return parse(data, func() *route.RouteConfiguration { return &route.RouteConfiguration{} }, ValidateRoutes)
+}
+
+// ParseSecrets parses a YAML/JSON list of Envoy Secrets.
+func ParseSecrets(data []byte) ([]*tls.Secret, error) {
+	return parse(data, func() *tls.Secret { return &tls.Secret{} }, ValidateSecrets)
+}
+
+func parse[T proto.Message](data []byte, newT func() T, validate func([]T) error) ([]T, error) {
+	docs, err := decodeList(data)
+	if err != nil {
 		return nil, err
 	}
 
-	var items []interface{}
-	if err := yaml.Unmarshal(data, &items); err != nil {
+	items := make([]T, len(docs))
+	for i, doc := range docs {
+		item := newT()
+		if err := protojson.Unmarshal(doc, item); err != nil {
+			return nil, fmt.Errorf("resource %d: %w", i, err)
+		}
+		items[i] = item
+	}
+
+	if err := validate(items); err != nil {
 		return nil, err
+	}
+	return items, nil
+}
+
+// decodeList expands env placeholders in data, parses it as YAML (a superset
+// of JSON) and returns each resource as its own JSON document, ready for
+// protojson.Unmarshal. The top level may be a list of resources, a single
+// resource, or empty. yaml.v3 decodes mappings as map[string]any, so
+// re-marshaling through encoding/json produces valid protojson input,
+// including "@type" keys for typed_config.
+func decodeList(data []byte) ([]json.RawMessage, error) {
+	data, err := ExpandEnv(data)
+	if err != nil {
+		return nil, err
+	}
+
+	var top any
+	if err := yaml.Unmarshal(data, &top); err != nil {
+		return nil, err
+	}
+
+	var items []any
+	switch v := top.(type) {
+	case nil:
+		return nil, nil
+	case []any:
+		items = v
+	case map[string]any:
+		items = []any{v}
+	default:
+		return nil, fmt.Errorf("expected a list of resources, got %T", top)
 	}
 
 	docs := make([]json.RawMessage, len(items))
@@ -199,53 +199,4 @@ func readResourceList(path string, required bool) ([]json.RawMessage, error) {
 		docs[i] = b
 	}
 	return docs, nil
-}
-
-func (c *Config) validate() error {
-	if len(c.Clusters) == 0 {
-		return fmt.Errorf("no clusters defined")
-	}
-	if len(c.Listeners) == 0 {
-		return fmt.Errorf("no listeners defined")
-	}
-
-	if err := requireUniqueNames("cluster", namesOf(c.Clusters, func(c *cluster.Cluster) string { return c.Name })); err != nil {
-		return err
-	}
-	if err := requireUniqueNames("listener", namesOf(c.Listeners, func(l *listener.Listener) string { return l.Name })); err != nil {
-		return err
-	}
-	if err := requireUniqueNames("endpoint cluster_name", namesOf(c.Endpoints, func(e *endpoint.ClusterLoadAssignment) string { return e.ClusterName })); err != nil {
-		return err
-	}
-	if err := requireUniqueNames("route", namesOf(c.Routes, func(r *route.RouteConfiguration) string { return r.Name })); err != nil {
-		return err
-	}
-	if err := requireUniqueNames("secret", namesOf(c.Secrets, func(s *tls.Secret) string { return s.Name })); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func namesOf[T any](items []T, name func(T) string) []string {
-	names := make([]string, len(items))
-	for i, item := range items {
-		names[i] = name(item)
-	}
-	return names
-}
-
-func requireUniqueNames(kind string, names []string) error {
-	seen := make(map[string]bool, len(names))
-	for _, name := range names {
-		if name == "" {
-			return fmt.Errorf("%s missing name", kind)
-		}
-		if seen[name] {
-			return fmt.Errorf("duplicate %s name %q", kind, name)
-		}
-		seen[name] = true
-	}
-	return nil
 }

@@ -189,6 +189,7 @@ import (
 
 	// _ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/client_ssl_auth/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/connection_limit/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/direct_response/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/dubbo_proxy/router/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/dubbo_proxy/v3"

@@ -2,7 +2,8 @@ package xds
 
 import (
 	"context"
-	"log"
+	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -10,8 +11,9 @@ import (
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 )
 
-// Callbacks logs the xDS stream lifecycle and tracks how many streams are
-// currently open. It satisfies server.Callbacks (sotw + delta + rest).
+// Callbacks logs the xDS stream lifecycle (at debug level, when Debug is
+// set) and tracks how many streams are currently open. It satisfies
+// server.Callbacks (sotw + delta + rest).
 type Callbacks struct {
 	Debug bool
 
@@ -30,7 +32,7 @@ func NewCallbacks(debug bool) *Callbacks {
 
 func (c *Callbacks) logf(format string, args ...any) {
 	if c.Debug {
-		log.Printf(format, args...)
+		slog.Debug(fmt.Sprintf(format, args...))
 	}
 }
 

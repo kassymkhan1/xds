@@ -1,0 +1,29 @@
+- name: echo
+  connect_timeout: 0.25s
+  type: STRICT_DNS
+  dns_lookup_family: V4_ONLY
+  lb_policy: ROUND_ROBIN
+  load_assignment:
+    cluster_name: echo
+    endpoints:
+      - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  address: 127.0.0.1
+                  port_value: 8090
+
+- name: dedicated
+  connect_timeout: 0.25s
+  type: STRICT_DNS
+  dns_lookup_family: V4_ONLY
+  lb_policy: ROUND_ROBIN
+  load_assignment:
+    cluster_name: dedicated
+    endpoints:
+      - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  address: 127.0.0.1
+                  port_value: 8091

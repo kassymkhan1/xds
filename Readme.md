@@ -10,13 +10,18 @@ The control plane serves configuration to connected Envoy proxies over gRPC (xDS
 - **EDS** (Endpoint Discovery Service) — endpoints within clusters, from [configs/eds.yaml](configs/eds.yaml) *(optional)*
 - **LDS** (Listener Discovery Service) — listeners, from [configs/lds.yaml](configs/lds.yaml)
 - **RDS** (Route Discovery Service) — routing rules, from [configs/rds.yaml](configs/rds.yaml) *(optional)*
-- **SDS** (Secret Discovery Service) — TLS certificates and secrets, from `configs/sds.yaml` *(optional, no default file)*
+- **SDS** (Secret Discovery Service) — TLS certificates and secrets, from [configs/sds.yaml](configs/sds.yaml) *(optional)*
 
 CDS and LDS are required - there's nothing to serve without at least one
 cluster and one listener. EDS, RDS, and SDS are optional: a cluster can embed
 its endpoints directly in `load_assignment` instead of pointing at EDS, and a
 listener can embed its `route_config` directly instead of pointing at RDS: if
 you don't reference one of those APIs, its config file doesn't need to exist.
+
+On top of the file-based config, clusters and listeners can be replaced at
+runtime through an HTTP and a gRPC **management API** (ported from
+`inf-xds`), and config sources can be fetched from a URL and templated with
+environment variables.
 
 Implemented in Go, on top of the official [envoyproxy/go-control-plane](https://github.com/envoyproxy/go-control-plane) library.
 
@@ -32,11 +37,11 @@ Under active development.
 
 ## Getting Started
 
-Requires Go 1.25+.
+Requires Go 1.26+.
 
 ```sh
 go mod tidy                        # fetch go-control-plane, grpc, protobuf
-go run ./cmd/xds-server -debug      # loads configs/{cds,eds,lds,rds}.yaml, starts the xDS server on :18000
+go run ./cmd/xds-server -debug      # loads configs/*.yaml, xDS on :18000, HTTP API on :2827
 ```
 
 Each config file is a top-level YAML list of raw Envoy resources in that
@@ -94,20 +99,93 @@ through EDS and a listener through RDS end to end:
           route: {cluster: backend_cluster}
 ```
 
-`configs/sds.yaml` (Secret resources) has no default file since there's no
-TLS material to ship as an example - point `-config-sds` at one if you need
-it.
-
 Referencing an extension type not already compiled in (another HTTP/network
 filter, a transport socket, etc.) needs a matching blank import added to
 `internal/config/register.go`, so `protojson` can resolve its `@type` when
 parsing the YAML.
 
-All five files are polled every 2s and hot-reloaded independently: editing
-and saving any one while `xds-server` is running pushes a new snapshot to
-connected Envoys without a restart, and a failure parsing one file doesn't
-touch the others' last-good config. Point at different files with
-`-config-cds`, `-config-eds`, `-config-lds`, `-config-rds`, `-config-sds`.
+Every resource is checked against Envoy's own proto validation rules and
+for unique names, and every EDS/RDS reference must resolve, so a broken
+config is rejected by the control plane (keeping the last-good one live)
+instead of being NACKed by every Envoy.
+
+Local files are polled every 2s and hot-reloaded independently: editing
+and saving one pushes a new snapshot with only that xDS API reloaded, and a
+failure parsing it doesn't touch the others' last-good config. Point at
+different sources with `-config-cds`, `-config-eds`, `-config-lds`,
+`-config-rds`, `-config-sds`; an empty value skips that API entirely.
+
+### Sources and templating
+
+A source can be a local file or an `http(s)://` URL (fetched once at
+startup, not polled). Any `{{ env "NAME" }}` placeholder is replaced with
+the environment variable `NAME` before parsing; an unset variable is an
+error, not an empty string:
+
+```yaml
+- name: upstream
+  type: STRICT_DNS
+  load_assignment:
+    cluster_name: upstream
+    endpoints:
+      - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: {address: '{{ env "UPSTREAM_HOST" }}', port_value: 8080}
+```
+
+### Configuration
+
+Every flag has an environment variable fallback (the names used by
+`inf-xds`, so existing deployments keep working). Flags win over env.
+
+| Flag | Env | Default | |
+|---|---|---|---|
+| `-grpc-addr` | `XDS_GRPC_API_IP`, `XDS_GRPC_API_PORT` | `:18000` | xDS (ADS) + gRPC management API |
+| `-http-addr` | `XDS_HTTP_API_IP`, `XDS_HTTP_API_PORT` | `:2827` | HTTP management API, empty disables |
+| `-node-id` | `XDS_NODE_ID` | `test-id` | must match Envoy's `node.id` |
+| `-log-level` | `XDS_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `-debug` | | `false` | log every xDS stream event |
+| `-bypass` | `XDS_BY_PASS` | `false` | log management API updates but don't apply them |
+| `-config-cds` | `XDS_CDS_BOOTSTRAP_FILE` / `_URL`, `XDS_SKIP_INITIAL_CDS` | `configs/cds.yaml` | required unless empty/skipped |
+| `-config-lds` | `XDS_LDS_BOOTSTRAP_FILE` / `_URL`, `XDS_SKIP_INITIAL_LDS` | `configs/lds.yaml` | required unless empty/skipped |
+| `-config-eds` | `XDS_EDS_BOOTSTRAP_FILE` | `configs/eds.yaml` | optional |
+| `-config-rds` | `XDS_RDS_BOOTSTRAP_FILE` | `configs/rds.yaml` | optional |
+| `-config-sds` | `XDS_SDS_BOOTSTRAP_FILE` | `configs/sds.yaml` | optional |
+
+`-port N` is still accepted as a deprecated alias for `-grpc-addr=:N`.
+
+### Management API
+
+HTTP (`-http-addr`). POST bodies are a YAML or JSON list of resources in the
+same shape as the config files; GET returns a JSON list.
+
+| | | |
+|---|---|---|
+| `GET /health` | | liveness probe |
+| `GET /clusters` | alias `/get_clusters` | served clusters |
+| `GET /listeners` | alias `/get_listeners` | served listeners |
+| `POST /clusters` | alias `/set_clusters` | replace all clusters |
+| `POST /listeners` | alias `/set_listeners` | replace all listeners |
+
+A POST answers `200 {"status":"applied","version":"N"}`, `400` for an
+unparsable or invalid body, `422` when the result would leave an EDS/RDS
+reference unresolved, and `202 {"status":"bypassed"}` in bypass mode.
+
+```sh
+curl -X POST --data-binary @configs/cds.yaml localhost:2827/clusters
+```
+
+gRPC: the `xds.XDS` service from [api/xds.proto](api/xds.proto) is served on
+the xDS port, with `Cluster` (replace clusters), `GetCDS` and `GetLDS`;
+resources travel as binary-encoded Envoy protos. Regenerate the Go code with
+`make proto`.
+
+Config files and the management API write to the same state, last writer
+wins: an API push stays in effect until the corresponding file changes
+(reloading `eds.yaml` doesn't touch clusters pushed through the API). To
+manage clusters or listeners purely through the API, skip their file with
+an empty `-config-cds=` / `-config-lds=`.
 
 Try it against a real Envoy using the example bootstrap, which points Envoy
 at this control plane over ADS:
@@ -120,21 +198,31 @@ envoy -c example/bootstrap.yaml
 
 ```sh
 docker build -t xds-server .
-docker run --rm -p 18000:18000 -v "$(pwd)/configs:/etc/xds/configs" xds-server -debug
+docker run --rm -p 18000:18000 -p 2827:2827 -v "$(pwd)/configs:/etc/xds/configs" xds-server -debug
 ```
 
 ## Project Structure
 
 ```
-cmd/xds-server/         entrypoint: flags, per-file config load/reload loop, gRPC server lifecycle
+cmd/xds-server/          entrypoint: flags/env, per-file reload loop, server lifecycle
+api/xds.proto            gRPC management API definition
+pkg/api/pb/              generated Go code for api/xds.proto (make proto)
 internal/config/
-  config.go               CDS/EDS/LDS/RDS/SDS YAML loaders + validator (raw Envoy resources, see above)
-  register.go              blank imports registering extension proto types for protojson
+  config.go               CDS/EDS/LDS/RDS/SDS loaders and parsers (raw Envoy resources)
+  source.go               file / http(s) URL sources
+  template.go             {{ env "NAME" }} expansion
+  validate.go             proto validation + unique names
+  register.go             blank imports registering extension proto types for protojson
 internal/xds/
-  resources.go            wraps loaded resources into an xDS snapshot
-  server.go                gRPC server wiring (ADS + individual xDS services, keepalive)
-  callbacks.go              xDS stream lifecycle logging (server.Callbacks implementation)
-configs/                 default config (see above): cds.yaml, eds.yaml, lds.yaml, rds.yaml
+  state.go                shared resource state, one consistent snapshot per change
+  resources.go            wraps resources into an xDS snapshot, checks references
+  server.go               gRPC server wiring (ADS + individual xDS services, keepalive)
+  callbacks.go            xDS stream lifecycle logging (server.Callbacks implementation)
+internal/api/
+  httpapi/                HTTP management API
+  grpcapi/                gRPC management API (xds.XDS)
+internal/env/            XDS_* environment variable helpers
+configs/                 default config: cds.yaml, eds.yaml, lds.yaml, rds.yaml, sds.yaml
 example/bootstrap.yaml   sample Envoy bootstrap that connects to this control plane via ADS
 ```
 
@@ -142,5 +230,5 @@ example/bootstrap.yaml   sample Envoy bootstrap that connects to this control pl
 xDS snapshot - no transformation, since `config.Load` already parsed them
 into the exact proto shapes Envoy expects. To source resources from
 somewhere other than a file (a service registry, Kubernetes CRDs, etc.),
-swap out `internal/config.Load` for your own loader and keep calling
-`cache.SetSnapshot` on change.
+push them through the management API, or call `xds.State.Update` from
+your own loader.

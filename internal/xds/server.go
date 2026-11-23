@@ -2,8 +2,6 @@ package xds
 
 import (
 	"context"
-	"fmt"
-	"net"
 	"time"
 
 	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
@@ -11,6 +9,7 @@ import (
 	endpointservice "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
 	listenerservice "github.com/envoyproxy/go-control-plane/envoy/service/listener/v3"
 	routeservice "github.com/envoyproxy/go-control-plane/envoy/service/route/v3"
+	runtimeservice "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/server/v3"
@@ -28,7 +27,8 @@ const (
 // NewGRPCServer wires an xDS control plane server (backed by snapCache and
 // callbacks) into a *grpc.Server, registering both the Aggregated Discovery
 // Service and the individual per-resource discovery services for clients
-// that don't speak ADS.
+// that don't speak ADS. Further services (the management API) can be
+// registered on the returned server before Serve.
 func NewGRPCServer(ctx context.Context, snapCache cache.Cache, callbacks server.Callbacks) *grpc.Server {
 	xdsSrv := server.NewServer(ctx, snapCache, callbacks)
 
@@ -52,11 +52,7 @@ func NewGRPCServer(ctx context.Context, snapCache cache.Cache, callbacks server.
 	routeservice.RegisterRouteDiscoveryServiceServer(grpcServer, xdsSrv)
 	listenerservice.RegisterListenerDiscoveryServiceServer(grpcServer, xdsSrv)
 	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, xdsSrv)
+	runtimeservice.RegisterRuntimeDiscoveryServiceServer(grpcServer, xdsSrv)
 
 	return grpcServer
-}
-
-// Listen opens a TCP listener for the management server on the given port.
-func Listen(port uint) (net.Listener, error) {
-	return net.Listen("tcp", fmt.Sprintf(":%d", port))
 }
